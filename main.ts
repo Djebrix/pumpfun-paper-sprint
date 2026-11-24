@@ -57,6 +57,13 @@ const CURVE_FEE_BPS = 125n; // 95 protocol + 30 creator, the hello fallbacks
 
 const ceilDiv = (a: bigint, b: bigint): bigint => (a + b - 1n) / b;
 
+/** Buy size for a curve: the 1%-of-real-reserve cap (state.maxBuyLamports),
+ *  clamped down to the 0.10 SOL stake. Pure function of the harness state. */
+function buyAmountLamports(state: BotState, mint: Pubkey): bigint {
+  const cap = state.maxBuyLamports(mint);
+  return cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
+}
+
 /** What the opening tape of one curve has shown so far. */
 interface Tape {
   createdSlot: number | null;
@@ -88,6 +95,24 @@ function tapeOf(mint: Pubkey): Tape {
     tapes.set(mint, t);
   }
   return t;
+}
+
+/** Exit rule: take profit +15%, stop loss -12%, at most 10 slots held, or the
+ *  moment any sell trade prints after the buy filled (the first seller is
+ *  the exit signal — the opening crowd is leaving). Pure function of the
+ *  current value, cost, holding age and the batch's sell tape. */
+function shouldExit(
+  valueLamports: bigint,
+  costLamports: bigint,
+  heldSlots: number,
+  soldAfterBuy: boolean,
+): boolean {
+  return (
+    valueLamports * 100n <= costLamports * STOP_LOSS_NUM ||
+    valueLamports * 100n >= costLamports * TAKE_PROFIT_NUM ||
+    heldSlots > MAX_HOLD_SLOTS ||
+    soldAfterBuy
+  );
 }
 
 /** Net SOL a full sell of `tokens` would pay now (curve + tx fees deducted). */
@@ -154,11 +179,7 @@ await runBot({
       if (h === undefined) continue;
       const value = positionValueLamports(state, mint, pos.token_amount);
       const cost = pos.cost_lamports;
-      const exit =
-        value * 100n <= cost * STOP_LOSS_NUM ||
-        value * 100n >= cost * TAKE_PROFIT_NUM ||
-        slot - h.openedSlot > MAX_HOLD_SLOTS ||
-        soldAfterBuy.has(mint);
+      const exit = shouldExit(value, cost, slot - h.openedSlot, soldAfterBuy.has(mint));
       if (!exit) continue;
       if (orders.length >= cap) break;
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
@@ -188,7 +209,7 @@ await runBot({
       if (t.anySell) continue;
       if (t.outsideBuyers.size > MAX_OUTSIDE_BUYERS) continue;
       if (t.creatorBuyLamports > MAX_CREATOR_BUY_LAMPORTS) continue;
-      const amount = state.maxBuyLamports(mint) < STAKE_LAMPORTS ? state.maxBuyLamports(mint) : STAKE_LAMPORTS;
+      const amount = buyAmountLamports(state, mint);
       if (amount < MIN_BUY_LAMPORTS) continue;
       if (free < amount + tx) continue;
       orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: BUY_SLIPPAGE_BPS });
